@@ -61,6 +61,7 @@ using ElementAccum = float;
 // §2  TiledMma 类型
 // ============================================================
 
+// wgmma is warp group level, not thread block level
 // Gemm-I (QK): SS 模式 — A=Q(smem), B=K(smem), C=S(寄存器)
 //   wgmma.m64n128k16_f32.f16.f16  (Major::K for both A and B)
 using TileShape_MNK_QK = Shape<Int<kBlockM>, Int<kBlockN>, Int<kHeadDim>>;
