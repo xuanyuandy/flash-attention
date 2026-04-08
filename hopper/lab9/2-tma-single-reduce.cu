@@ -18,27 +18,83 @@ typedef __nv_bfloat16 bf16;
 ////////////////////////////////////////////////////////////////////////////////
 // Part 2: Single Block, Single Tile TMA Reduce
 ////////////////////////////////////////////////////////////////////////////////
-
-// Feel free to change the interface to this function if you
-// are using a different tile dimension that 2d.
+// TMA reduce-add 的 PTX 内联汇编
+// 对比 store 版本:  cp.async.bulk.tensor.2d.global.shared::cta.tile.bulk_group
+// reduce-add 版本:  cp.reduce.async.bulk.tensor.2d.global.shared::cta.add.tile.bulk_group
 __device__ static __forceinline__ void
 cp_async_reduce_add_bulk_tensor_2d_shared_to_global(
     const CUtensorMap *tensor_map, int c0, int c1, const void *src) {
-    /* TODO: your TMA reduce intrinsic here... */
+    asm volatile(
+        "cp.reduce.async.bulk.tensor.2d.global.shared::cta.add.tile.bulk_group "
+        "[%0, {%1, %2}], [%3];\n"
+        :
+        : "l"(tensor_map), "r"(c0), "r"(c1),
+          "r"(static_cast<uint32_t>(__cvta_generic_to_shared(src)))
+        : "memory");
 }
 
 template <int TILE_M, int TILE_N>
 __global__ void
 single_tma_reduce(__grid_constant__ const CUtensorMap src_map,
                   __grid_constant__ const CUtensorMap dest_map) {
-    /* TODO: your TMA store code here... */
+    __shared__ __align__(128) bf16 smem[TILE_M * TILE_N];
+    __shared__ __align__(8) uint64_t bar;
+
+    if (threadIdx.x == 0) {
+        // TMA Load: global → shared
+        init_barrier(&bar, 1);
+        expect_bytes_and_arrive(&bar, TILE_M * TILE_N * sizeof(bf16));
+        cp_async_bulk_tensor_2d_global_to_shared(
+            smem, &src_map, 0, 0, &bar);
+    }
+
+    __syncthreads();
+    wait(&bar, 0);
+
+    // TMA Reduce-Add: shared → global (原子加)
+    async_proxy_fence();
+
+    if (threadIdx.x == 0) {
+        cp_async_reduce_add_bulk_tensor_2d_shared_to_global(
+            &dest_map, 0, 0, smem);
+        tma_commit_group();
+        tma_wait_until_pending<0>();
+    }
 }
 
 template <int TILE_M, int TILE_N>
 void launch_single_tma_reduce(bf16 *src, bf16 *dest) {
-    /* TODO: your launch code here... */
-}
+    CUtensorMap src_map;
+    uint64_t globalDim[2]      = {TILE_N, TILE_M};
+    uint64_t globalStrides[1]  = {TILE_N * sizeof(bf16)};
+    uint32_t boxDim[2]         = {TILE_N, TILE_M};
+    uint32_t elementStrides[2] = {1, 1};
 
+    CUDA_CHECK(cuTensorMapEncodeTiled(
+        &src_map,
+        CU_TENSOR_MAP_DATA_TYPE_BFLOAT16,
+        2, (void *)src,
+        globalDim, globalStrides, boxDim, elementStrides,
+        CU_TENSOR_MAP_INTERLEAVE_NONE,
+        CU_TENSOR_MAP_SWIZZLE_NONE,
+        CU_TENSOR_MAP_L2_PROMOTION_NONE,
+        CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE
+    ));
+
+    CUtensorMap dest_map;
+    CUDA_CHECK(cuTensorMapEncodeTiled(
+        &dest_map,
+        CU_TENSOR_MAP_DATA_TYPE_BFLOAT16,
+        2, (void *)dest,
+        globalDim, globalStrides, boxDim, elementStrides,
+        CU_TENSOR_MAP_INTERLEAVE_NONE,
+        CU_TENSOR_MAP_SWIZZLE_NONE,
+        CU_TENSOR_MAP_L2_PROMOTION_NONE,
+        CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE
+    ));
+
+    single_tma_reduce<TILE_M, TILE_N><<<1, 128>>>(src_map, dest_map);
+}
 /// <--- /your code here --->
 
 ////////////////////////////////////////////////////////////////////////////////

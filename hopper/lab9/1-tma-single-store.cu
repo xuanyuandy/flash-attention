@@ -18,19 +18,72 @@ typedef __nv_bfloat16 bf16;
 ////////////////////////////////////////////////////////////////////////////////
 // Part 1: Single Block, Single Tile TMA Store
 ////////////////////////////////////////////////////////////////////////////////
-
 template <int TILE_M, int TILE_N>
 __global__ void single_tma_store(__grid_constant__ const CUtensorMap src_map,
                                  __grid_constant__ const CUtensorMap dest_map) {
-    /* TODO: your TMA store code here... */
+    __shared__ __align__(128) bf16 smem[TILE_M * TILE_N];
+    __shared__ __align__(8) uint64_t bar;
+
+    if (threadIdx.x == 0) {
+        // ===== Phase 1: TMA Load (global → shared) =====
+        init_barrier(&bar, 1);
+        expect_bytes_and_arrive(&bar, TILE_M * TILE_N * sizeof(bf16));
+        cp_async_bulk_tensor_2d_global_to_shared(
+            smem, &src_map, 0, 0, &bar);
+    }
+
+    __syncthreads();
+    wait(&bar, 0);
+
+    // ===== Phase 2: TMA Store (shared → global) =====
+    // 确保 shared memory 的写入对 async proxy 可见
+    async_proxy_fence();
+
+    if (threadIdx.x == 0) {
+        cp_async_bulk_tensor_2d_shared_to_global(
+            &dest_map, 0, 0, smem);
+
+        // TMA store 用 bulk_group 机制来等待完成
+        tma_commit_group();
+        tma_wait_until_pending<0>();
+    }
 }
 
 template <int TILE_M, int TILE_N>
 void launch_single_tma_store(bf16 *src, bf16 *dest) {
-    /* TODO: your launch code here... */
-}
+    // src tensor map (用于 load)
+    CUtensorMap src_map;
+    uint64_t globalDim[2]      = {TILE_N, TILE_M};
+    uint64_t globalStrides[1]  = {TILE_N * sizeof(bf16)};
+    uint32_t boxDim[2]         = {TILE_N, TILE_M};
+    uint32_t elementStrides[2] = {1, 1};
 
-/// <--- /your code here --->
+    CUDA_CHECK(cuTensorMapEncodeTiled(
+        &src_map,
+        CU_TENSOR_MAP_DATA_TYPE_BFLOAT16,
+        2, (void *)src,
+        globalDim, globalStrides, boxDim, elementStrides,
+        CU_TENSOR_MAP_INTERLEAVE_NONE,
+        CU_TENSOR_MAP_SWIZZLE_NONE,
+        CU_TENSOR_MAP_L2_PROMOTION_NONE,
+        CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE
+    ));
+
+    // dest tensor map (用于 store)
+    CUtensorMap dest_map;
+    CUDA_CHECK(cuTensorMapEncodeTiled(
+        &dest_map,
+        CU_TENSOR_MAP_DATA_TYPE_BFLOAT16,
+        2, (void *)dest,
+        globalDim, globalStrides, boxDim, elementStrides,
+        CU_TENSOR_MAP_INTERLEAVE_NONE,
+        CU_TENSOR_MAP_SWIZZLE_NONE,
+        CU_TENSOR_MAP_L2_PROMOTION_NONE,
+        CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE
+    ));
+
+    single_tma_store<TILE_M, TILE_N><<<1, 128>>>(src_map, dest_map);
+}
 
 ////////////////////////////////////////////////////////////////////////////////
 ///          YOU DO NOT NEED TO MODIFY THE CODE BELOW HERE.                  ///

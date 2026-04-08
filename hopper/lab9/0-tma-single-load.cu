@@ -22,12 +22,67 @@ typedef __nv_bfloat16 bf16;
 template <int TILE_M, int TILE_N>
 __global__ void single_tma_load(__grid_constant__ const CUtensorMap src_map,
                                 bf16 *dest) {
-    /* TODO: your TMA load code here... */
+    // 1. 在 shared memory 中分配 tile 空间和 mbarrier
+    __shared__ __align__(128) bf16 smem[TILE_M * TILE_N];
+    __shared__ __align__(8) uint64_t bar;
+
+    // 2. 只需要一个线程发起 TMA 操作
+    if (threadIdx.x == 0) {
+        // 初始化 mbarrier，arrival_count = 1（只有 thread 0 会 arrive）
+        init_barrier(&bar, 1);
+
+        // 告诉 barrier 期待多少字节的数据，同时完成一次 arrive
+        expect_bytes_and_arrive(&bar, TILE_M * TILE_N * sizeof(bf16));
+
+        // 发起 TMA 2D load: global -> shared
+        // 坐标 (0, 0) 表示从 tensor 的起始位置开始加载
+        cp_async_bulk_tensor_2d_global_to_shared(
+            smem, &src_map, /*c0=*/0, /*c1=*/0, &bar);
+    }
+
+    // 3. 确保所有线程都能看到 barrier 的初始化
+    __syncthreads();
+
+    // 4. 等待 TMA 传输完成（phase parity = 0，第一次使用）
+    wait(&bar, /*phaseParity=*/0);
+
+    // 5. 所有线程协作，将 shared memory 数据写回 global memory (dest)
+    for (int i = threadIdx.x; i < TILE_M * TILE_N; i += blockDim.x) {
+        dest[i] = smem[i];
+    }
 }
 
 template <int TILE_M, int TILE_N>
 void launch_single_tma_load(bf16 *src, bf16 *dest) {
-    /* TODO: your launch code here... */
+    // 创建 TMA tensor map 描述符
+    CUtensorMap tensor_map;
+
+    // TMA 使用 "fastest-dim-first" 的惯例：
+    //   对于 row-major [M][N] 矩阵，dim0 = 列(N), dim1 = 行(M)
+    uint64_t globalDim[2]     = {TILE_N, TILE_M};
+    // globalStrides 只需 rank-1 个值，表示 dim1 方向的字节步长
+    uint64_t globalStrides[1] = {TILE_N * sizeof(bf16)};
+    // box 大小 = tile 大小（整个矩阵就是一个 tile）
+    uint32_t boxDim[2]        = {TILE_N, TILE_M};
+    uint32_t elementStrides[2]= {1, 1};
+
+    CUDA_CHECK(cuTensorMapEncodeTiled(
+        &tensor_map,
+        CU_TENSOR_MAP_DATA_TYPE_BFLOAT16,
+        /*rank=*/2,
+        /*globalAddress=*/(void *)src,
+        globalDim,
+        globalStrides,
+        boxDim,
+        elementStrides,
+        CU_TENSOR_MAP_INTERLEAVE_NONE,
+        CU_TENSOR_MAP_SWIZZLE_NONE,
+        CU_TENSOR_MAP_L2_PROMOTION_NONE,
+        CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE
+    ));
+
+    // 启动 1 个 block，128 个线程（用于最后的 store-back）
+    single_tma_load<TILE_M, TILE_N><<<1, 128>>>(tensor_map, dest);
 }
 
 /// <--- /your code here --->
