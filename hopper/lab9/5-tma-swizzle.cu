@@ -19,33 +19,57 @@ using datatype = uint8_t;
 template <int TILE_M, int TILE_N, int OFFSET>
 __global__ void tma_swizzle(__grid_constant__ const CUtensorMap src_map,
                             datatype *dest) {
-    /*
-     * IMPORTANT REQUIREMENT FOR PART 5:
-     *
-     * To get credit, you need to use smem_buffer to store your TMA data.
-     * Do not edit the setup for smem_buffer.
-     */
     __shared__ alignas(128)
         datatype smem_buffer_abs[TILE_M * TILE_N + 128 * OFFSET];
     datatype *smem_buffer = &smem_buffer_abs[128 * OFFSET];
 
-    // Cast to a "shared pointer" so that it works with
-    // cp_async_bulk_tensor_2d_global_to_shared.
+    __shared__ __align__(8) uint64_t bar;
 
-    /* TODO: your launch code here... */
+    // TMA Load with swizzle into shared memory
+    if (threadIdx.x == 0) {
+        init_barrier(&bar, 1);
+        expect_bytes_and_arrive(&bar, TILE_M * TILE_N * sizeof(datatype));
+        cp_async_bulk_tensor_2d_global_to_shared(
+            smem_buffer, &src_map, 0, 0, &bar);
+    }
+    __syncthreads();
+    wait(&bar, 0);
+
+    // Compute swizzle key from absolute shared memory address
+    uint32_t smem_addr = static_cast<uint32_t>(
+        __cvta_generic_to_shared(smem_buffer));
+    int key = (smem_addr >> 7) & 0x3;   // bits [8:7]
+
+    // Unswizzle: for each logical position j, compute where TMA put it
+    for (int j = threadIdx.x; j < TILE_M * TILE_N; j += blockDim.x) {
+        int chunk         = (j >> 4) & 0x3;        // 16B chunk index within 64B
+        int swizzled_chunk = chunk ^ key;
+        int swizzled_j     = (j & 0xF) | (swizzled_chunk << 4);
+        dest[j] = smem_buffer[swizzled_j];
+    }
 }
 
 template <int TILE_M, int TILE_N, int OFFSET>
 void launch_tma_swizzle(datatype *src, datatype *dest) {
+    CUtensorMap src_map;
 
-    /*
-     * IMPORTANT REQUIREMENT FOR PART 5:
-     *
-     * To get credit for this part, launch the tma_swizzle
-     * kernel with the CU_TENSOR_MAP_SWIZZLE_64B setting.
-     */
+    uint64_t globalDim[2]      = {(uint64_t)TILE_N, (uint64_t)TILE_M};
+    uint64_t globalStrides[1]  = {(uint64_t)(TILE_N * sizeof(datatype))};
+    uint32_t boxDim[2]         = {(uint32_t)TILE_N, (uint32_t)TILE_M};
+    uint32_t elementStrides[2] = {1, 1};
 
-    /* TODO: your launch code here... */
+    CUDA_CHECK(cuTensorMapEncodeTiled(
+        &src_map,
+        CU_TENSOR_MAP_DATA_TYPE_UINT8,
+        2, (void *)src,
+        globalDim, globalStrides, boxDim, elementStrides,
+        CU_TENSOR_MAP_INTERLEAVE_NONE,
+        CU_TENSOR_MAP_SWIZZLE_64B,             // ← 64B swizzle
+        CU_TENSOR_MAP_L2_PROMOTION_NONE,
+        CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE
+    ));
+
+    tma_swizzle<TILE_M, TILE_N, OFFSET><<<1, 32>>>(src_map, dest);
 }
 
 /// <--- your code here --->

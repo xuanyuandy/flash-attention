@@ -15,28 +15,131 @@ typedef __nv_bfloat16 bf16;
 ////////////////////////////////////////////////////////////////////////////////
 // Part 4: Bring Your Own Warp Scheduler
 ////////////////////////////////////////////////////////////////////////////////
+constexpr int COLS       = 128;
+constexpr int TILE_ROWS  = 64;
+constexpr int TILE_ELEMS = TILE_ROWS * COLS;           // 8192
+constexpr int TILE_BYTES = TILE_ELEMS * sizeof(bf16);  // 16384
+
+constexpr int NUM_WARPS  = 7;
+constexpr int STAGES     = 2;
+constexpr int TOTAL_BUFS = NUM_WARPS * STAGES;          // 14
+constexpr int DATA_BYTES = TOTAL_BUFS * TILE_BYTES;     // 229376
+constexpr int MAX_SMEM   = 232448;                       // H100 max (227KB)
+
+// Layout: [buf0|buf1|...|buf13 | bar0|bar1|...|bar13]
 
 __global__ void
 tma_multiwarp_pipeline(__grid_constant__ const CUtensorMap tensor_map,
                        __grid_constant__ const CUtensorMap dest_tensor_map,
                        const int N) {
-    /* TODO: your TMA memcpy kernel here... */
+    extern __shared__ __align__(128) char smem[];
+    uint64_t *bars = (uint64_t *)(smem + DATA_BYTES);
+
+    int warp_id = threadIdx.x / 32;
+    int lane_id = threadIdx.x % 32;
+
+    // 只有 7 个 warp 的 lane 0 干活
+    if (warp_id >= NUM_WARPS || lane_id != 0) return;
+
+    int total_tiles = N / TILE_ELEMS;
+
+    // ── Block 级工作划分（连续块）──
+    int tiles_per_blk = (total_tiles + gridDim.x - 1) / gridDim.x;
+    int blk_start     = blockIdx.x * tiles_per_blk;
+    int blk_end       = min(blk_start + tiles_per_blk, total_tiles);
+
+    // ── Warp 级工作划分（块内交错）──
+    // warp j 处理: blk_start+j, blk_start+j+NUM_WARPS, ...
+    int my_buf = warp_id * STAGES;  // 我的 buffer 起始索引
+
+    // ① 初始化 barrier
+    for (int s = 0; s < STAGES; s++)
+        init_barrier(&bars[my_buf + s], 1);
+
+    // ② Prefill: 发射前 STAGES 个 load 填满流水线
+    for (int s = 0; s < STAGES; s++) {
+        int tile = blk_start + warp_id + s * NUM_WARPS;
+        if (tile >= blk_end) break;
+        expect_bytes_and_arrive(&bars[my_buf + s], TILE_BYTES);
+        cp_async_bulk_tensor_2d_global_to_shared(
+            smem + (my_buf + s) * TILE_BYTES,
+            &tensor_map, 0, tile * TILE_ROWS,
+            &bars[my_buf + s]);
+    }
+
+    // ③ 主循环
+    int iter = 0;
+    for (int tile = blk_start + warp_id;
+         tile < blk_end;
+         tile += NUM_WARPS, iter++)
+    {
+        int s     = iter % STAGES;
+        int phase = (iter / STAGES) % 2;
+
+        // 等当前 tile 的 load 完成
+        wait(&bars[my_buf + s], phase);
+
+        // Store: shared → global
+        async_proxy_fence();
+        cp_async_bulk_tensor_2d_shared_to_global(
+            &dest_tensor_map, 0, tile * TILE_ROWS,
+            smem + (my_buf + s) * TILE_BYTES);
+        tma_commit_group();
+
+        // 为这个 stage 发射下一轮 load（复用 buffer）
+        int next_tile = tile + STAGES * NUM_WARPS;
+        if (next_tile < blk_end) {
+            // 确保此 buffer 上的旧 store 已读完
+            tma_wait_until_pending<2>();
+            expect_bytes_and_arrive(&bars[my_buf + s], TILE_BYTES);
+            cp_async_bulk_tensor_2d_global_to_shared(
+                smem + (my_buf + s) * TILE_BYTES,
+                &tensor_map, 0, next_tile * TILE_ROWS,
+                &bars[my_buf + s]);
+        }
+    }
+
+    // ④ 等所有 store 完成
+    tma_wait_until_pending<0>();
 }
 
 void launch_multiwarp_pipeline(bf16 *dest, bf16 *src, const int N) {
-    /*
-     * IMPORTANT REQUIREMENT FOR PART 4:
-     *
-     * To receive credit for this part, you MUST launch the kernel with maximum
-     * shared memory allocated.
-     *
-     * Use cudaFuncSetAttribute() with
-     * cudaFuncAttributeMaxDynamicSharedMemorySize to configure the maximum
-     * available shared memory before launching the kernel, and then **launch**
-     * it with the maximum amount.
-     */
+    int total_rows = N / COLS;
 
-    /* TODO: your launch code here... */
+    uint64_t globalDim[2]      = {(uint64_t)COLS, (uint64_t)total_rows};
+    uint64_t globalStrides[1]  = {COLS * sizeof(bf16)};
+    uint32_t boxDim[2]         = {(uint32_t)COLS, (uint32_t)TILE_ROWS};
+    uint32_t elementStrides[2] = {1, 1};
+
+    CUtensorMap src_map;
+    CUDA_CHECK(cuTensorMapEncodeTiled(
+        &src_map, CU_TENSOR_MAP_DATA_TYPE_BFLOAT16,
+        2, (void *)src,
+        globalDim, globalStrides, boxDim, elementStrides,
+        CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_NONE,
+        CU_TENSOR_MAP_L2_PROMOTION_NONE, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE));
+
+    CUtensorMap dest_map;
+    CUDA_CHECK(cuTensorMapEncodeTiled(
+        &dest_map, CU_TENSOR_MAP_DATA_TYPE_BFLOAT16,
+        2, (void *)dest,
+        globalDim, globalStrides, boxDim, elementStrides,
+        CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_NONE,
+        CU_TENSOR_MAP_L2_PROMOTION_NONE, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE));
+
+    // H100 有 132 个 SM，每个 SM 只能放 1 个 block
+    int total_tiles = total_rows / TILE_ROWS;
+    int num_blocks  = min(total_tiles, 132);
+
+    // 必须设置最大动态共享内存
+    CUDA_CHECK(cudaFuncSetAttribute(
+        tma_multiwarp_pipeline,
+        cudaFuncAttributeMaxDynamicSharedMemorySize,
+        MAX_SMEM));
+
+    // 启动: 7 warps = 224 threads, 使用最大共享内存
+    tma_multiwarp_pipeline<<<num_blocks, NUM_WARPS * 32, MAX_SMEM>>>(
+        src_map, dest_map, N);
 }
 
 /// <--- /your code here --->
