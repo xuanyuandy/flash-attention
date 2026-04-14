@@ -37,6 +37,7 @@ __global__ void single_tma_store(__grid_constant__ const CUtensorMap src_map,
 
     // ===== Phase 2: TMA Store (shared → global) =====
     // 确保 shared memory 的写入对 async proxy 可见
+    // async_proxy_fence may not work when TMA store and TMA load are in same async proxy
     async_proxy_fence();
 
     if (threadIdx.x == 0) {

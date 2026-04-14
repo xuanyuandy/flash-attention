@@ -24,6 +24,7 @@ typedef __nv_bfloat16 bf16;
 __device__ static __forceinline__ void
 cp_async_reduce_add_bulk_tensor_2d_shared_to_global(
     const CUtensorMap *tensor_map, int c0, int c1, const void *src) {
+    // dst += src
     asm volatile(
         "cp.reduce.async.bulk.tensor.2d.global.shared::cta.add.tile.bulk_group "
         "[%0, {%1, %2}], [%3];\n"
@@ -44,6 +45,8 @@ single_tma_reduce(__grid_constant__ const CUtensorMap src_map,
         // TMA Load: global → shared
         init_barrier(&bar, 1);
         expect_bytes_and_arrive(&bar, TILE_M * TILE_N * sizeof(bf16));
+        // cp.async.bulk.tensor.2d.shared::cluster.global.tile.mbarrier::complete_
+        // global -> smem, mbarrier to wait for completion
         cp_async_bulk_tensor_2d_global_to_shared(
             smem, &src_map, 0, 0, &bar);
     }
@@ -55,6 +58,8 @@ single_tma_reduce(__grid_constant__ const CUtensorMap src_map,
     async_proxy_fence();
 
     if (threadIdx.x == 0) {
+        // cp.reduce.async.bulk.tensor.2d.global.shared::cta.add.tile.bulk_group
+        // smem -> global, bulk_group mechanism to wait for completion
         cp_async_reduce_add_bulk_tensor_2d_shared_to_global(
             &dest_map, 0, 0, smem);
         tma_commit_group();
@@ -117,6 +122,7 @@ int main() {
     for (int i = 0; i < total_size; i++) {
         matrix[i] = 1;
     }
+    // prepare dest matrix filled with 1
     cudaMemcpy(d_dest, matrix, total_size * sizeof(bf16),
                cudaMemcpyHostToDevice);
 
